@@ -365,7 +365,6 @@ class TortoiseApp:
   visible = lines[start:start + body_height]
   for idx, (text, attr) in enumerate(visible, start=1):
    self.addn(idx, 0, text, width, attr)
-  self.addn(height - 2, 0, "─" * width, width, self.color("divider"))
   self.draw_input_bar(height - 1, width)
   self.stdscr.refresh()
 
