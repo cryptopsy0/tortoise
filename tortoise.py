@@ -12,6 +12,8 @@ import argparse
 import curses
 import json
 import os
+import getpass
+import pwd
 import queue
 import shlex
 import shutil
@@ -91,12 +93,41 @@ class Transcript:
   return "\n".join(parts)
 
 
+def launch_user_home() -> Path:
+ explicit_home = os.environ.get("TORTOISE_USER_HOME")
+ if explicit_home:
+  return Path(explicit_home).expanduser()
+ sudo_user = os.environ.get("SUDO_USER")
+ if sudo_user and sudo_user != "root":
+  try:
+   return Path(pwd.getpwnam(sudo_user).pw_dir)
+  except KeyError:
+   pass
+ if os.geteuid() == 0 and Path("/h/.hermes").exists():
+  return Path("/h")
+ try:
+  return Path(pwd.getpwnam(getpass.getuser()).pw_dir)
+ except KeyError:
+  return Path.home()
+
+
+def default_hermes_bin() -> str:
+ explicit_bin = os.environ.get("TORTOISE_HERMES_BIN")
+ if explicit_bin:
+  return explicit_bin
+ user_bin = launch_user_home() / ".local" / "bin" / "hermes"
+ if user_bin.exists():
+  return str(user_bin)
+ return shutil.which("hermes") or "hermes"
+
+
 class HermesRunner:
  def __init__(self, hermes_bin: str, model: str | None, provider: str | None, toolsets: str | None) -> None:
   self.hermes_bin = hermes_bin
   self.model = model
   self.provider = provider
   self.toolsets = toolsets
+  self.user_home = launch_user_home()
 
  def command(self, prompt: str) -> list[str]:
   cmd = [self.hermes_bin]
@@ -109,6 +140,14 @@ class HermesRunner:
   cmd += ["--oneshot", prompt]
   return cmd
 
+ def env(self) -> dict[str, str]:
+  env = os.environ.copy()
+  env.setdefault("HOME", str(self.user_home))
+  if Path(env.get("HOME", "")) == Path("/root") and self.user_home != Path("/root"):
+   env["HOME"] = str(self.user_home)
+  env.setdefault("HERMES_HOME", str(self.user_home / ".hermes"))
+  return env
+
  def ask(self, prompt: str) -> str:
   try:
    proc = subprocess.run(
@@ -118,6 +157,7 @@ class HermesRunner:
     stderr=subprocess.PIPE,
     timeout=None,
     check=False,
+    env=self.env(),
    )
   except FileNotFoundError:
    return "hermes executable not found. install Hermes or pass --hermes-bin."
@@ -329,12 +369,15 @@ class TortoiseApp:
 
 
 def default_state_dir() -> Path:
- return Path(os.environ.get("TORTOISE_HOME") or os.environ.get("HERMI_HOME") or Path.home() / ".local" / "state" / "tortoise")
+ configured = os.environ.get("TORTOISE_HOME") or os.environ.get("HERMI_HOME")
+ if configured:
+  return Path(configured).expanduser()
+ return launch_user_home() / ".local" / "state" / "tortoise"
 
 
 def build_parser() -> argparse.ArgumentParser:
  parser = argparse.ArgumentParser(description="Standalone Python Hermes TUI")
- parser.add_argument("--hermes-bin", default=shutil.which("hermes") or "hermes")
+ parser.add_argument("--hermes-bin", default=default_hermes_bin())
  parser.add_argument("--model")
  parser.add_argument("--provider")
  parser.add_argument("--toolsets")
