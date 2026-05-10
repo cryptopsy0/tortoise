@@ -131,7 +131,7 @@ class HermesRunner:
   return f"hermes failed: {detail}"
 
 
-class HermiApp:
+class TortoiseApp:
  def __init__(self, stdscr, transcript: Transcript, runner: HermesRunner) -> None:
   self.stdscr = stdscr
   self.transcript = transcript
@@ -350,7 +350,7 @@ def main(argv: list[str] | None = None) -> int:
   print(" ".join(shlex.quote(part) for part in runner.command("hello")))
   return 0
  transcript = Transcript(args.transcript)
- curses.wrapper(lambda stdscr: HermiApp(stdscr, transcript, runner).run())
+ curses.wrapper(lambda stdscr: TortoiseApp(stdscr, transcript, runner).run())
  return 0
 
 
