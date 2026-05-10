@@ -48,6 +48,7 @@ keybindings
  scroll_down down
  page_up page_up
  page_down page_down
+ backspace backspace
 """
 COLOR_NAMES = {
  "black": curses.COLOR_BLACK,
@@ -62,6 +63,18 @@ COLOR_NAMES = {
  "light_grey": curses.COLOR_WHITE,
  "gray": curses.COLOR_WHITE,
  "grey": curses.COLOR_WHITE,
+}
+KEY_NAMES = {
+ "escape": (27,),
+ "esc": (27,),
+ "ctrl_c": (3,),
+ "enter": (10, 13),
+ "return": (10, 13),
+ "up": (curses.KEY_UP,),
+ "down": (curses.KEY_DOWN,),
+ "page_up": (curses.KEY_PPAGE,),
+ "page_down": (curses.KEY_NPAGE,),
+ "backspace": (curses.KEY_BACKSPACE, 127, 8),
 }
 
 
@@ -85,6 +98,7 @@ class TortoiseConfig:
   "scroll_down": "down",
   "page_up": "page_up",
   "page_down": "page_down",
+  "backspace": "backspace",
  })
 
  @classmethod
@@ -302,8 +316,8 @@ class TortoiseApp:
   self.context_percent = self.transcript.context_percent()
   self.usage_percent = load_usage_percent(self.runner.env(), self.runner.user_home)
   self.help_text = (
-   "/help commands | /new clear transcript | /clear clear screen | "
-   "/model show model | /quit exit"
+   ":help commands | :new clear transcript | :clear clear screen | "
+   ":model show model | :r restart | :quit exit"
   )
 
  def run(self) -> None:
@@ -333,6 +347,11 @@ class TortoiseApp:
   name = self.config.color.get(key) or fallback
   return self.color_attrs.get(name, self.color_attrs.get(fallback, curses.A_NORMAL))
 
+ def key_matches(self, action: str, key: int) -> bool:
+  spec = self.config.keybindings.get(action, "")
+  names = [part for part in re.split(r"[ ,]+", spec) if part]
+  return any(key in KEY_NAMES.get(name, ()) for name in names)
+
  def draw(self) -> None:
   self.stdscr.erase()
   height, width = self.stdscr.getmaxyx()
@@ -351,16 +370,15 @@ class TortoiseApp:
   self.stdscr.refresh()
 
  def draw_input_bar(self, y: int, width: int) -> None:
-  prompt = "> "
-  self.addn(y, 0, prompt, width, self.color("input"))
+  prompt = ""
   if self.input_text:
-   self.addn(y, len(prompt), self.input_text, width, self.color("input"))
-   cursor_x = min(width - 1, len(prompt) + len(self.input_text))
+   self.addn(y, 0, self.input_text, width, self.color("input"))
+   cursor_x = min(width - 1, len(self.input_text))
   else:
    ctx = f"{self.context_percent}%"
    usage = f"{self.usage_percent}%"
-   self.addn(y, len(prompt), ctx, width, self.color("context") | curses.A_BOLD)
-   self.addn(y, len(prompt) + len(ctx) + 1, usage, width, self.color("usage") | curses.A_BOLD)
+   self.addn(y, 0, ctx, width, self.color("context") | curses.A_BOLD)
+   self.addn(y, len(ctx) + 1, usage, width, self.color("usage") | curses.A_BOLD)
    cursor_x = len(prompt)
   self.stdscr.move(y, min(width - 1, cursor_x))
 
@@ -401,25 +419,25 @@ class TortoiseApp:
  def handle_key(self, key: int) -> None:
   if key in (curses.KEY_RESIZE,):
    return
-  if key in (curses.KEY_UP,):
+  if self.key_matches("scroll_up", key):
    self.scroll += 1
    return
-  if key in (curses.KEY_DOWN,):
+  if self.key_matches("scroll_down", key):
    self.scroll = max(0, self.scroll - 1)
    return
-  if key in (curses.KEY_PPAGE,):
+  if self.key_matches("page_up", key):
    self.scroll += 10
    return
-  if key in (curses.KEY_NPAGE,):
+  if self.key_matches("page_down", key):
    self.scroll = max(0, self.scroll - 10)
    return
-  if key in (10, 13):
+  if self.key_matches("submit", key):
    self.submit()
    return
-  if key in (3, 27):
+  if self.key_matches("quit", key) or key == 3:
    self.running = False
    return
-  if key in (curses.KEY_BACKSPACE, 127, 8):
+  if self.key_matches("backspace", key):
    self.input_text = self.input_text[:-1]
    return
   if 0 <= key < 256:
@@ -432,7 +450,7 @@ class TortoiseApp:
   self.input_text = ""
   if not text:
    return
-  if text.startswith("/"):
+  if text.startswith(":") or text.startswith("/"):
    self.handle_command(text)
    return
   if self.busy:
@@ -462,38 +480,53 @@ class TortoiseApp:
    self.busy = False
    self.status = "ready"
 
+ def restart(self) -> None:
+  try:
+   curses.endwin()
+  except curses.error:
+   pass
+  os.execv(sys.executable, [sys.executable, *sys.argv])
+
  def handle_command(self, text: str) -> None:
-  cmd, _, rest = text.partition(" ")
-  if cmd in ("/q", "/quit", "/exit"):
+  raw = text.strip()
+  if raw[:1] in (":", "/"):
+   raw = raw[1:]
+  name, _, rest = raw.partition(" ")
+  cmd = f":{name}"
+  if cmd in (":q", ":quit", ":exit"):
    self.running = False
    return
-  if cmd in ("/help", "/h"):
+  if cmd in (":r", ":restart"):
+   self.status = "restarting"
+   self.restart()
+   return
+  if cmd in (":help", ":h"):
    self.transcript.append("system", self.help_text)
    return
-  if cmd in ("/new", "/reset"):
+  if cmd in (":new", ":reset"):
    self.transcript.clear()
    self.refresh_context_percent()
    self.status = "new transcript"
    return
-  if cmd == "/clear":
+  if cmd == ":clear":
    self.scroll = 0
    self.status = "screen cleared"
    return
-  if cmd == "/model":
+  if cmd == ":model":
    if rest.strip():
     self.runner.model = rest.strip()
     self.status = f"model {self.runner.model}"
    else:
     self.transcript.append("system", f"model {self.runner.model or 'default'}")
    return
-  if cmd == "/provider":
+  if cmd == ":provider":
    if rest.strip():
     self.runner.provider = rest.strip()
     self.status = f"provider {self.runner.provider}"
    else:
     self.transcript.append("system", f"provider {self.runner.provider or 'default'}")
    return
-  if cmd == "/tools":
+  if cmd == ":tools":
    if rest.strip():
     self.runner.toolsets = rest.strip()
     self.status = f"toolsets {self.runner.toolsets}"
