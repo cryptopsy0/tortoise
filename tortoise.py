@@ -15,6 +15,7 @@ import os
 import getpass
 import pwd
 import queue
+import re
 import shlex
 import shutil
 import subprocess
@@ -30,6 +31,83 @@ from pathlib import Path
 APP_NAME = "tortoise"
 TRANSCRIPT_LIMIT = 12
 MAX_CONTEXT_CHARS = 24_000
+DEFAULT_CONFIG_TEXT = """color
+ user light_gray
+ assistant default
+ system yellow
+ header cyan
+ input green
+ divider blue
+ context yellow
+ usage magenta
+ help yellow
+keybindings
+ quit escape
+ submit enter
+ scroll_up up
+ scroll_down down
+ page_up page_up
+ page_down page_down
+"""
+COLOR_NAMES = {
+ "black": curses.COLOR_BLACK,
+ "red": curses.COLOR_RED,
+ "green": curses.COLOR_GREEN,
+ "yellow": curses.COLOR_YELLOW,
+ "blue": curses.COLOR_BLUE,
+ "magenta": curses.COLOR_MAGENTA,
+ "cyan": curses.COLOR_CYAN,
+ "white": curses.COLOR_WHITE,
+ "light_gray": curses.COLOR_WHITE,
+ "light_grey": curses.COLOR_WHITE,
+ "gray": curses.COLOR_WHITE,
+ "grey": curses.COLOR_WHITE,
+}
+
+
+@dataclass
+class TortoiseConfig:
+ color: dict[str, str] = field(default_factory=lambda: {
+  "user": "light_gray",
+  "assistant": "default",
+  "system": "yellow",
+  "header": "cyan",
+  "input": "green",
+  "divider": "blue",
+  "context": "yellow",
+  "usage": "magenta",
+  "help": "yellow",
+ })
+ keybindings: dict[str, str] = field(default_factory=lambda: {
+  "quit": "escape",
+  "submit": "enter",
+  "scroll_up": "up",
+  "scroll_down": "down",
+  "page_up": "page_up",
+  "page_down": "page_down",
+ })
+
+ @classmethod
+ def load(cls, path: Path) -> "TortoiseConfig":
+  path.parent.mkdir(parents=True, exist_ok=True)
+  if not path.exists():
+   path.write_text(DEFAULT_CONFIG_TEXT, encoding="utf-8")
+  cfg = cls()
+  section = ""
+  for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+   if not raw_line.strip() or raw_line.lstrip().startswith("#"):
+    continue
+   if raw_line[:1].isspace():
+    key, _, value = raw_line.strip().partition(" ")
+    if not key or not value.strip():
+     continue
+    if section == "color":
+     cfg.color[key] = value.strip()
+    if section == "keybindings":
+     cfg.keybindings[key] = value.strip()
+    continue
+   section = raw_line.strip()
+  return cfg
 
 
 @dataclass
@@ -91,6 +169,10 @@ class Transcript:
    parts.append(item)
   parts.extend(["", "user", f" {user_text}"])
   return "\n".join(parts)
+
+ def context_percent(self) -> int:
+  prompt = self.prompt_with_context("")
+  return max(0, min(100, round((len(prompt) / MAX_CONTEXT_CHARS) * 100)))
 
 
 def launch_user_home() -> Path:
@@ -171,11 +253,45 @@ class HermesRunner:
   return f"hermes failed: {detail}"
 
 
+def load_usage_percent(env: dict[str, str], user_home: Path) -> int:
+ script = """
+import json
+import sys
+sys.path.insert(0, '{home}/.hermes/hermes-agent')
+from tui_gateway import server
+info = server._lightweight_session_info()
+usage = info.get('usage') or {{}}
+value = usage.get('codex_all_auth_used_percent')
+if value is None:
+ value = usage.get('codex_five_hour_used_percent')
+print(0 if value is None else round(float(value)))
+""".format(home=str(user_home))
+ python_bin = user_home / ".hermes" / "hermes-agent" / "venv" / "bin" / "python"
+ try:
+  proc = subprocess.run(
+   [str(python_bin) if python_bin.exists() else sys.executable, "-c", script],
+   text=True,
+   stdout=subprocess.PIPE,
+   stderr=subprocess.PIPE,
+   timeout=3,
+   check=False,
+   env=env,
+  )
+ except Exception:
+  return 0
+ match = re.search(r"-?\d+", (proc.stdout + proc.stderr).strip())
+ if not match:
+  return 0
+ return max(0, min(100, int(match.group(0))))
+
+
 class TortoiseApp:
- def __init__(self, stdscr, transcript: Transcript, runner: HermesRunner) -> None:
+ def __init__(self, stdscr, transcript: Transcript, runner: HermesRunner, config: TortoiseConfig) -> None:
   self.stdscr = stdscr
   self.transcript = transcript
   self.runner = runner
+  self.config = config
+  self.color_attrs: dict[str, int] = {"default": curses.A_NORMAL}
   self.input_text = ""
   self.scroll = 0
   self.status = "ready"
@@ -183,6 +299,8 @@ class TortoiseApp:
   self.running = True
   self.busy = False
   self.busy_started = 0.0
+  self.context_percent = self.transcript.context_percent()
+  self.usage_percent = load_usage_percent(self.runner.env(), self.runner.user_home)
   self.help_text = (
    "/help commands | /new clear transcript | /clear clear screen | "
    "/model show model | /quit exit"
@@ -202,21 +320,24 @@ class TortoiseApp:
    self.handle_key(key)
 
  def init_colors(self) -> None:
+  self.color_attrs = {"default": curses.A_NORMAL}
   if not curses.has_colors():
    return
   curses.start_color()
   curses.use_default_colors()
-  curses.init_pair(1, curses.COLOR_CYAN, -1)
-  curses.init_pair(2, curses.COLOR_GREEN, -1)
-  curses.init_pair(3, curses.COLOR_YELLOW, -1)
-  curses.init_pair(4, curses.COLOR_RED, -1)
-  curses.init_pair(5, curses.COLOR_BLUE, -1)
+  for pair_id, (name, fg) in enumerate(COLOR_NAMES.items(), start=1):
+   curses.init_pair(pair_id, fg, -1)
+   self.color_attrs[name] = curses.color_pair(pair_id)
+
+ def color(self, key: str, fallback: str = "default") -> int:
+  name = self.config.color.get(key) or fallback
+  return self.color_attrs.get(name, self.color_attrs.get(fallback, curses.A_NORMAL))
 
  def draw(self) -> None:
   self.stdscr.erase()
   height, width = self.stdscr.getmaxyx()
   header = self.header(width)
-  self.addn(0, 0, header, width, curses.color_pair(1) | curses.A_BOLD)
+  self.addn(0, 0, header, width, self.color("header") | curses.A_BOLD)
   body_height = max(1, height - 3)
   lines = self.render_messages(max(20, width - 2))
   max_scroll = max(0, len(lines) - body_height)
@@ -225,12 +346,23 @@ class TortoiseApp:
   visible = lines[start:start + body_height]
   for idx, (text, attr) in enumerate(visible, start=1):
    self.addn(idx, 0, text, width, attr)
-  prompt = "> " + self.input_text
-  self.addn(height - 2, 0, "─" * width, width, curses.color_pair(5))
-  self.addn(height - 1, 0, prompt, width, curses.color_pair(2))
-  cursor_x = min(width - 1, len(prompt))
-  self.stdscr.move(height - 1, cursor_x)
+  self.addn(height - 2, 0, "─" * width, width, self.color("divider"))
+  self.draw_input_bar(height - 1, width)
   self.stdscr.refresh()
+
+ def draw_input_bar(self, y: int, width: int) -> None:
+  prompt = "> "
+  self.addn(y, 0, prompt, width, self.color("input"))
+  if self.input_text:
+   self.addn(y, len(prompt), self.input_text, width, self.color("input"))
+   cursor_x = min(width - 1, len(prompt) + len(self.input_text))
+  else:
+   ctx = f"{self.context_percent}%"
+   usage = f"{self.usage_percent}%"
+   self.addn(y, len(prompt), ctx, width, self.color("context") | curses.A_BOLD)
+   self.addn(y, len(prompt) + len(ctx) + 1, usage, width, self.color("usage") | curses.A_BOLD)
+   cursor_x = len(prompt)
+  self.stdscr.move(y, min(width - 1, cursor_x))
 
  def header(self, width: int) -> str:
   if self.busy:
@@ -243,20 +375,17 @@ class TortoiseApp:
 
  def render_messages(self, width: int) -> list[tuple[str, int]]:
   if not self.transcript.messages:
-   return [("Hermes standalone Python TUI", curses.A_BOLD), (self.help_text, curses.color_pair(3))]
+   return [("Hermes standalone Python TUI", curses.A_BOLD), (self.help_text, self.color("help"))]
   out: list[tuple[str, int]] = []
   for msg in self.transcript.messages:
-   color = curses.color_pair(2) if msg.role == "user" else curses.color_pair(0)
-   if msg.role == "system":
-    color = curses.color_pair(3)
-   label = f"{msg.role} "
+   color = self.color(msg.role)
    text = msg.text.rstrip() or " "
    wrapped = []
    for para in text.splitlines() or [""]:
-    wrapped.extend(textwrap.wrap(para, width=max(8, width - 2), replace_whitespace=False) or [""])
-   out.append((label + wrapped[0], color | curses.A_BOLD))
+    wrapped.extend(textwrap.wrap(para, width=max(8, width), replace_whitespace=False) or [""])
+   out.append((wrapped[0], color))
    for line in wrapped[1:]:
-    out.append((" " + line, color))
+    out.append((line, color))
    out.append(("", curses.A_NORMAL))
   return out
 
@@ -265,6 +394,9 @@ class TortoiseApp:
    self.stdscr.addnstr(y, x, text, max(0, width - x - 1), attr)
   except curses.error:
    pass
+
+ def refresh_context_percent(self) -> None:
+  self.context_percent = self.transcript.context_percent()
 
  def handle_key(self, key: int) -> None:
   if key in (curses.KEY_RESIZE,):
@@ -307,6 +439,7 @@ class TortoiseApp:
    self.transcript.append("system", "Hermes is already thinking. Wait for the current reply.")
    return
   self.transcript.append("user", text)
+  self.refresh_context_percent()
   prompt = self.transcript.prompt_with_context(text)
   self.busy = True
   self.busy_started = time.time()
@@ -325,6 +458,7 @@ class TortoiseApp:
    except queue.Empty:
     return
    self.transcript.append(role, text)
+   self.refresh_context_percent()
    self.busy = False
    self.status = "ready"
 
@@ -338,6 +472,7 @@ class TortoiseApp:
    return
   if cmd in ("/new", "/reset"):
    self.transcript.clear()
+   self.refresh_context_percent()
    self.status = "new transcript"
    return
   if cmd == "/clear":
