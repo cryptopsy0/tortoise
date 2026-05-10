@@ -517,6 +517,7 @@ def build_parser() -> argparse.ArgumentParser:
  parser.add_argument("--provider")
  parser.add_argument("--toolsets")
  parser.add_argument("--transcript", type=Path, default=default_state_dir() / "transcript.jsonl")
+ parser.add_argument("--config", type=Path, default=default_state_dir() / "config")
  parser.add_argument("--print-command", action="store_true", help="print the Hermes command shape and exit")
  return parser
 
@@ -528,7 +529,8 @@ def main(argv: list[str] | None = None) -> int:
   print(" ".join(shlex.quote(part) for part in runner.command("hello")))
   return 0
  transcript = Transcript(args.transcript)
- curses.wrapper(lambda stdscr: TortoiseApp(stdscr, transcript, runner).run())
+ config = TortoiseConfig.load(args.config)
+ curses.wrapper(lambda stdscr: TortoiseApp(stdscr, transcript, runner, config).run())
  return 0
 
 
